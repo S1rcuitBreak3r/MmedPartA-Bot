@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+APScheduler==3.10.4
+anthropic>=0.39,<1.0
+python-dotenv>=1.0
+fpdf2>=2.7
+tzdata>=2024.1
