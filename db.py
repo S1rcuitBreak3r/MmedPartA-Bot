@@ -222,6 +222,22 @@ def get_user_by_display_name(name: str):
         return dict(row) if row else None
 
 
+def get_user_by_username(username: str):
+    """Case-insensitive lookup by telegram_username, ANY status — unlike
+    find_linkable_by_username (which only matches unlinked pending/active rows), this is
+    for /adduser's pre-check so it can report an existing user instead of creating a
+    duplicate row for the same person (telegram_username has no DB-level unique
+    constraint, since it's legitimately blank for /linkuser-onboarded users)."""
+    if not username:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE telegram_username != '' AND LOWER(telegram_username) = LOWER(?)",
+            (username,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def find_linkable_by_username(username: str):
     """A row awaiting a chat-id link for this username (case-insensitive) — covers both
     a pending candidate and the bootstrapped-but-not-yet-linked admin (§7)."""

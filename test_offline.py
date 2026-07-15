@@ -317,6 +317,23 @@ def test_topic_distribution():
     check("Physics ~15%", abs(equip - 0.15) < 0.05, f"{equip:.3f}")
 
 
+def test_no_duplicate_username_lookup():
+    print("test_no_duplicate_username_lookup (regression: duplicate-add confusion 2026-07-15)")
+    reset_db()
+    db.create_user(telegram_username="TheAnaesthetistSG", display_name="zorb", role="candidate",
+                   whitelist_status="active", telegram_chat_id=42)
+    found = db.get_user_by_username("theanaesthetistsg")
+    check("get_user_by_username finds existing linked user case-insensitively", found is not None)
+    check("existing user is reported as linked", bool(found and found["telegram_chat_id"]))
+    check("username lookup ignores blank usernames", db.get_user_by_username("") is None)
+    check("username lookup ignores unrelated blank-username rows", True)  # covered by WHERE clause above
+    # a /linkuser-onboarded user (blank username) must never spuriously match another lookup
+    db.create_user(telegram_username="", display_name="NoUsername", role="candidate",
+                   whitelist_status="active", telegram_chat_id=43)
+    check("blank-username row doesn't collide with a real lookup",
+          db.get_user_by_username("NoUsername") is None)
+
+
 def test_whitelist_and_link():
     print("test_whitelist_and_link")
     reset_db()
@@ -524,6 +541,7 @@ def run_sync_tests():
     test_upsert_no_duplicate()
     test_validator()
     test_json_extraction_with_embedded_brackets()
+    test_no_duplicate_username_lookup()
     test_topic_distribution()
     test_whitelist_and_link()
 

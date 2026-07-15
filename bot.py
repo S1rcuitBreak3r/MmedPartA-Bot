@@ -257,6 +257,21 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     username = context.args[0].lstrip("@")
     display_name = " ".join(context.args[1:])
+
+    existing = db.get_user_by_username(username)
+    if existing:
+        if existing["telegram_chat_id"]:
+            await update.message.reply_text(
+                f"@{username} is already added as '{existing['display_name']}' "
+                f"({existing['whitelist_status']}, linked) — no need to re-add. "
+                f"Check /listusers or /progress {existing['display_name']}.")
+        else:
+            await update.message.reply_text(
+                f"@{username} is already added as '{existing['display_name']}' "
+                f"({existing['whitelist_status']}, not yet linked) — they just need to send /start, "
+                f"not be re-added.")
+        return
+
     db.create_user(telegram_username=username, display_name=display_name,
                    role="candidate", whitelist_status="pending", added_by=admin["id"])
     await update.message.reply_text(
