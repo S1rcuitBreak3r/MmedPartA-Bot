@@ -1,12 +1,13 @@
 """
-Orchestration (§8). One per-user check function, `_check_user`, invoked from FIVE
-call sites — the AM/PM crons, the hourly safety net, startup, and the on-quiz-
+Orchestration (§8). One per-user check function, `_check_user`, invoked from FOUR
+call sites — the daily cron, the hourly safety net, startup, and the on-quiz-
 completion recheck — all serialized by ONE asyncio.Lock so concurrent generation of
 the same shared lesson_queue sequence can't race the UNIQUE constraint.
 
-Delivery is gated by a PACE MARKER (timeutil): every slot boundary grants one credit,
-each delivery consumes exactly one (marker advances by one slot, never jumps to "now"),
-which is what makes catch-up deliver one session per completion instead of a flood.
+Delivery is gated by a PACE MARKER (timeutil): one lesson slot per calendar day,
+unlocked at the daily trigger time. Each delivery consumes exactly one credit
+(marker advances by one day, never jumps to "now"), which is what makes catch-up
+deliver one session per completion instead of a flood.
 """
 from __future__ import annotations
 
@@ -26,11 +27,11 @@ import quiz_engine
 from claude_client import ClaudeError
 from config import (
     MAX_RETRIES, RETRY_BACKOFF_SECONDS, TIMEZONE,
-    AM_TRIGGER_HOUR, AM_TRIGGER_MINUTE, PM_TRIGGER_HOUR, PM_TRIGGER_MINUTE, SAFETY_NET_MINUTE,
+    AM_TRIGGER_HOUR, AM_TRIGGER_MINUTE, SAFETY_NET_MINUTE,
     OVERDUE_NUDGE_THRESHOLD_DAYS, FAILURE_ALERT_THRESHOLD, FAILURE_ALERT_COOLDOWN_HOURS,
 )
 from timeutil import (
-    sgt_now, sgt_today, to_iso, from_iso, slot_of, slot_marker, marker_to_fields,
+    sgt_now, sgt_today, to_iso, from_iso, current_marker, marker_to_fields,
     fields_to_marker, initial_pace_marker,
 )
 from typing_util import typing_indicator
@@ -149,15 +150,15 @@ async def _check_user(bot, user: dict, now):
         pd, ps = marker_to_fields(pace_marker)
         db.set_pace_marker(uid, pd, ps)
 
-    current_marker = slot_marker(now)
+    now_marker = current_marker(now)
 
     # (1) Due-check first, so no-op ticks are silent and reminders can be throttled.
-    if not (pace_marker < current_marker):
+    if not (pace_marker < now_marker):
         return
 
-    # (2) A delivery is due, but an unanswered quiz blocks it → remind, once per slot.
+    # (2) A delivery is due, but an unanswered quiz blocks it → remind, once per day.
     if user["is_paused"] or db.get_active_quiz_run(uid):
-        cur_marker_str = ":".join(marker_to_fields(current_marker))
+        cur_marker_str = ":".join(marker_to_fields(now_marker))
         if prog.get("last_reminder_marker") == cur_marker_str:
             return
         run = db.get_active_quiz_run(uid)
@@ -181,16 +182,12 @@ async def _check_user(bot, user: dict, now):
     await send_with_retry(bot, chat_id, rendered)  # delivery AFTER persistence
 
     mcqs = db.get_mcqs_for_seq(next_seq)
-    quiz_type = "daily_" + slot_of(now)
     questions = quiz_engine.questions_for_lesson(mcqs)
-    await quiz_engine.start_quiz(bot, user, quiz_type, next_seq, questions)
+    await quiz_engine.start_quiz(bot, user, "daily", next_seq, questions)
 
-    # Consume exactly one slot credit (never jump to "now"), then persist progress.
+    # Consume exactly one day's credit (never jump to "now"), then persist progress.
     new_pace = pace_marker + 1
-    if new_pace == current_marker:
-        last_slot = marker_to_fields(new_pace)[1]      # caught up: label with the real slot
-    else:
-        last_slot = "catchup"                           # still behind
+    last_slot = "daily" if new_pace == now_marker else "catchup"  # caught-up vs still-behind
     pd, ps = marker_to_fields(new_pace)
     db.record_delivery(uid, next_seq, to_iso(now.date()) + "T" + now.strftime("%H:%M:%S"),
                        last_slot, pd, ps)
@@ -248,11 +245,11 @@ async def _handle_user_failure(bot, user: dict, exc: Exception):
 
 
 # --------------------------------------------------------------------------- #
-# The five call sites
+# The four call sites
 # --------------------------------------------------------------------------- #
 
 async def run_all(bot):
-    """Batch trigger (crons, hourly safety net, startup). Per-user fault isolation:
+    """Batch trigger (cron, hourly safety net, startup). Per-user fault isolation:
     one user's failure never aborts the loop."""
     async with _run_lock:
         now = sgt_now()
@@ -277,8 +274,8 @@ async def recheck_user(bot, user: dict):
 
 
 async def force_lesson(bot, user: dict) -> str:
-    """/forcelesson (§13): deliver the next lesson now, ignoring the pace/slot timing gate
-    but STILL respecting the pause gate. Consumes one slot credit so the real scheduler
+    """/forcelesson (§13): deliver the next lesson now, ignoring the pace timing gate
+    but STILL respecting the pause gate. Consumes one day's credit so the real scheduler
     doesn't double-deliver. Returns a short status string for the caller to relay."""
     async with _run_lock:
         now = sgt_now()
@@ -289,7 +286,7 @@ async def force_lesson(bot, user: dict) -> str:
         pace_marker = fields_to_marker(prog.get("pace_date"), prog.get("pace_slot"))
         if pace_marker is None:
             pace_marker = initial_pace_marker(now)
-        current_marker = slot_marker(now)
+        now_marker = current_marker(now)
 
         next_seq = prog["current_sequence_number"] + 1
         chat_id = fresh["telegram_chat_id"]
@@ -302,15 +299,14 @@ async def force_lesson(bot, user: dict) -> str:
         await send_with_retry(bot, chat_id, rendered)
 
         mcqs = db.get_mcqs_for_seq(next_seq)
-        quiz_type = "daily_" + slot_of(now)
-        await quiz_engine.start_quiz(bot, fresh, quiz_type, next_seq,
+        await quiz_engine.start_quiz(bot, fresh, "daily", next_seq,
                                      quiz_engine.questions_for_lesson(mcqs))
 
         # Consume exactly one credit (may push the marker ahead of the clock, which just
         # means the next scheduled boundary correctly no-ops for this user).
         new_pace = pace_marker + 1
         pd, ps = marker_to_fields(new_pace)
-        last_slot = "catchup" if new_pace < current_marker else ps
+        last_slot = "catchup" if new_pace < now_marker else ps
         db.record_delivery(fresh["id"], next_seq,
                            to_iso(now.date()) + "T" + now.strftime("%H:%M:%S"), last_slot, pd, ps)
         await _pre_generate_leading(bot)
@@ -325,11 +321,7 @@ def build_scheduler(bot) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     scheduler.add_job(
         run_all, CronTrigger(hour=AM_TRIGGER_HOUR, minute=AM_TRIGGER_MINUTE, timezone=TIMEZONE),
-        args=[bot], id="daily_am", misfire_grace_time=3600,
-    )
-    scheduler.add_job(
-        run_all, CronTrigger(hour=PM_TRIGGER_HOUR, minute=PM_TRIGGER_MINUTE, timezone=TIMEZONE),
-        args=[bot], id="daily_pm", misfire_grace_time=3600,
+        args=[bot], id="daily_trigger", misfire_grace_time=3600,
     )
     scheduler.add_job(
         run_all, CronTrigger(minute=SAFETY_NET_MINUTE, timezone=TIMEZONE),

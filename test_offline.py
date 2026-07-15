@@ -4,7 +4,7 @@ and stub credentials before importing the app, patches the clock and the Claude 
 call, and uses a FakeBot that records sends.
 
 Run: python test_offline.py
-Covers: slot/pace math, the primary slot-gating fix, reminder throttle, ladder math + upsert,
+Covers: daily pace-marker math, the primary over-delivery fix, reminder throttle, ladder math + upsert,
 whitelist matching + linkuser, topic-weighting distribution, semantic JSON validation,
 persist-before-send / no-regenerate, per-user fault isolation, admin failure alert + cooldown,
 the typing indicator, and the quiz flow (scoring, wrong→retest, completion unpause).
@@ -127,10 +127,10 @@ async def answer_active(bot, user, choose):
         run = db.get_active_quiz_run(user["id"])
 
 
-def _seed_candidate(name, chat_id, pace_slots_behind=1, now=FIXED):
+def _seed_candidate(name, chat_id, pace_days_behind=1, now=FIXED):
     uid = db.create_user(telegram_username=name.lower().replace(" ", "_"), display_name=name,
                          role="candidate", whitelist_status="active", telegram_chat_id=chat_id)
-    marker = timeutil.slot_marker(now) - pace_slots_behind
+    marker = timeutil.current_marker(now) - pace_days_behind
     pd, ps = timeutil.marker_to_fields(marker)
     db.set_pace_marker(uid, pd, ps)
     return db.get_user_by_id(uid)
@@ -138,23 +138,25 @@ def _seed_candidate(name, chat_id, pace_slots_behind=1, now=FIXED):
 
 # --- Tests ------------------------------------------------------------------
 
-def test_slot_math():
-    print("test_slot_math")
-    am = datetime(2026, 7, 20, 9, 30, tzinfo=SGT)
-    just_before = datetime(2026, 7, 20, 9, 29, tzinfo=SGT)
-    pm = datetime(2026, 7, 20, 14, 30, tzinfo=SGT)
-    after_midnight = datetime(2026, 7, 21, 0, 15, tzinfo=SGT)
-    check("09:30 is AM window", timeutil.slot_of(am) == "am")
-    check("09:29 is PM window (prev day)", timeutil.slot_of(just_before) == "pm")
-    check("14:30 is PM window", timeutil.slot_of(pm) == "pm")
-    check("00:15 classifies as pm", timeutil.slot_of(after_midnight) == "pm")
-    # 00:15 on the 21st belongs to the 20th's PM slot
-    m_midnight = timeutil.slot_marker(after_midnight)
-    m_pm20 = timeutil.slot_marker(pm)
-    check("00:15(21st) marker == PM(20th) marker", m_midnight == m_pm20,
-          f"{m_midnight} vs {m_pm20}")
-    # AM marker is exactly one less than same-day PM marker
-    check("AM+1 == PM same day", timeutil.slot_marker(am) + 1 == timeutil.slot_marker(pm))
+def test_pace_marker_math():
+    print("test_pace_marker_math")
+    from datetime import date
+    before_trigger = datetime(2026, 7, 20, 9, 29, tzinfo=SGT)
+    at_trigger = datetime(2026, 7, 20, 9, 30, tzinfo=SGT)
+    mid_day = datetime(2026, 7, 20, 15, 0, tzinfo=SGT)
+    just_after_midnight = datetime(2026, 7, 21, 0, 15, tzinfo=SGT)
+    day20 = date(2026, 7, 20).toordinal()
+    day21 = date(2026, 7, 21).toordinal()
+    check("09:29 (before trigger) belongs to the PREVIOUS day's slot",
+          timeutil.current_marker(before_trigger) == day20 - 1)
+    check("09:30 (at trigger) opens today's slot",
+          timeutil.current_marker(at_trigger) == day20)
+    check("mid-afternoon is still today's slot", timeutil.current_marker(mid_day) == day20)
+    check("00:15 next calendar day still belongs to the PREVIOUS day's slot (trigger hasn't hit yet)",
+          timeutil.current_marker(just_after_midnight) == day21 - 1)
+    check("marker advances by exactly 1 per day",
+          timeutil.current_marker(at_trigger) + 1 ==
+          timeutil.current_marker(datetime(2026, 7, 21, 9, 30, tzinfo=SGT)))
 
 
 def test_ladder():
@@ -358,7 +360,7 @@ async def test_slot_gating_on_time():
     reset_db()
     install_patches()
     bot = FakeBot()
-    user = _seed_candidate("OnTime", 100, pace_slots_behind=1)
+    user = _seed_candidate("OnTime", 100, pace_days_behind=1)
 
     await scheduler.run_all(bot)
     check("first run delivers exactly 1 lesson", len(bot.lessons_to(100)) == 1)
@@ -380,7 +382,7 @@ async def test_slot_gating_catchup():
     reset_db()
     install_patches()
     bot = FakeBot()
-    user = _seed_candidate("Behind", 200, pace_slots_behind=4)  # 4 slots behind
+    user = _seed_candidate("Behind", 200, pace_days_behind=4)  # 4 days behind
 
     delivered = 0
     for _ in range(6):
@@ -403,19 +405,28 @@ async def test_reminder_throttle():
     reset_db()
     install_patches()
     bot = FakeBot()
-    user = _seed_candidate("Rem", 300, pace_slots_behind=1)
-    # Deliver AM lesson (pauses the user).
+    user = _seed_candidate("Rem", 300, pace_days_behind=1)
+    # Deliver today's lesson (pauses the user), consuming today's only credit.
     await scheduler.run_all(bot)
-    # Advance the clock to the PM slot; now a delivery is due but the user is still paused.
-    pm = FIXED.replace(hour=14, minute=30)
-    patch_clock(pm)
     before = len([t for c, t in bot.messages if c == 300 and "unanswered" in t])
+    # Several hourly safety-net ticks later THE SAME DAY, still paused: today's credit is
+    # already spent, so nothing new is due — these must stay silent, not nag.
     await scheduler.run_all(bot)
-    await scheduler.run_all(bot)  # several ticks in the same PM slot
+    await scheduler.run_all(bot)
     await scheduler.run_all(bot)
     after = len([t for c, t in bot.messages if c == 300 and "unanswered" in t])
-    check("exactly one reminder across multiple same-slot ticks", after - before == 1,
+    check("no reminder fires while today's credit is already consumed", after - before == 0,
           f"{after - before}")
+    # Next day, past the trigger, still paused → a new day's credit is due but blocked →
+    # exactly one reminder, and repeated ticks that same (new) day stay silent too.
+    patch_clock(FIXED + timedelta(days=1))
+    await scheduler.run_all(bot)
+    after2 = len([t for c, t in bot.messages if c == 300 and "unanswered" in t])
+    check("a new day's tick fires exactly one reminder", after2 - after == 1, f"{after2 - after}")
+    await scheduler.run_all(bot)
+    await scheduler.run_all(bot)
+    after3 = len([t for c, t in bot.messages if c == 300 and "unanswered" in t])
+    check("repeated ticks the same (new) day don't re-nag", after3 - after2 == 0, f"{after3 - after2}")
     patch_clock(FIXED)  # restore
 
 
@@ -439,8 +450,8 @@ async def test_fault_isolation():
     reset_db()
     install_patches()
     bot = FakeBot()
-    a = _seed_candidate("Alpha", 401, pace_slots_behind=1)
-    b = _seed_candidate("Bravo", 402, pace_slots_behind=1)
+    a = _seed_candidate("Alpha", 401, pace_days_behind=1)
+    b = _seed_candidate("Bravo", 402, pace_days_behind=1)
 
     orig_send = scheduler.send_with_retry
 
@@ -467,7 +478,7 @@ async def test_admin_alert():
     # admin, linked
     aid = db.create_user(telegram_username="the_admin", display_name="Admin", role="admin",
                          whitelist_status="active", telegram_chat_id=9000)
-    cand = _seed_candidate("Faily", 500, pace_slots_behind=1)
+    cand = _seed_candidate("Faily", 500, pace_days_behind=1)
 
     async def boom_gen(topic):
         raise RuntimeError("generation down")
@@ -507,10 +518,10 @@ async def test_quiz_flow_scoring_and_retest():
     reset_db()
     install_patches()
     bot = FakeBot()
-    user = _seed_candidate("Quiz", 600, pace_slots_behind=1)
+    user = _seed_candidate("Quiz", 600, pace_days_behind=1)
     await scheduler.ensure_sequence_generated(1)
     mcqs = db.get_mcqs_for_seq(1)
-    await quiz_engine.start_quiz(bot, user, "daily_am", 1, quiz_engine.questions_for_lesson(mcqs))
+    await quiz_engine.start_quiz(bot, user, "daily", 1, quiz_engine.questions_for_lesson(mcqs))
     check("start_quiz pauses user", db.get_user_by_id(user["id"])["is_paused"] == 1)
 
     # Answer Q1 wrong (choose a deliberately wrong letter), the rest correct.
@@ -536,7 +547,7 @@ async def test_quiz_flow_scoring_and_retest():
 
 
 def run_sync_tests():
-    test_slot_math()
+    test_pace_marker_math()
     test_ladder()
     test_upsert_no_duplicate()
     test_validator()

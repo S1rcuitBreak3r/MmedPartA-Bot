@@ -32,11 +32,10 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 TIMEZONE = "Asia/Singapore"  # UTC+8, no daylight saving
 
 # --- Scheduling (§8) -------------------------------------------------------------
-# Two daily delivery windows. These same constants anchor BOTH the cron triggers
-# and the slot-window math (current_slot / slot_marker in timeutil.py). Keep the
+# One daily delivery, unlocked at this trigger time. This constant anchors BOTH the
+# cron trigger and the pace-marker math (current_marker in timeutil.py). Keep the
 # tuple precision — a bare hour>= check is the reference bot's midnight-rollover bug.
 AM_TRIGGER_HOUR, AM_TRIGGER_MINUTE = 9, 30
-PM_TRIGGER_HOUR, PM_TRIGGER_MINUTE = 14, 30
 SAFETY_NET_MINUTE = 45  # hourly safety-net cron
 
 # --- Spaced repetition (§5) ------------------------------------------------------

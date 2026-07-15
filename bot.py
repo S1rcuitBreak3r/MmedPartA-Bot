@@ -74,7 +74,7 @@ def _resolve_target(caller: dict, args) -> dict | None:
 
 HELP_TEXT = (
     "M.Med Anaesthesiology Part A exam-prep bot.\n\n"
-    "Two lessons a day (09:30 & 14:30 SGT), each with a 5-question MCQ quiz, paced to you.\n\n"
+    "One lesson a day (09:30 SGT), with a 5-question MCQ quiz right after, paced to you.\n\n"
     "Commands:\n"
     "/status — where you stand\n"
     "/recap — retest questions you've gotten wrong (when due)\n"

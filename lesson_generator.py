@@ -19,8 +19,11 @@ TOPIC_AREAS = {"Pharmacology", "Physiology", "Equipment", "Others"}
 AMBIGUITY_LINE = "Ask an appropriate M.Med examiner to resolve this area of controversy."
 
 PERSONA_SYSTEM_PROMPT = """\
-You are writing exam-prep content for candidates sitting the Singapore M.Med \
-(Anaesthesiology) Part A examination (single-best-answer MCQs, 5 options A-E).
+You are writing exam-prep REVISION content for candidates sitting the Singapore \
+M.Med (Anaesthesiology) Part A examination (single-best-answer MCQs, 5 options A-E). \
+This is a quick refresher tool, not a textbook chapter — candidates use it to recall \
+and consolidate facts they've already studied elsewhere, not to learn a topic from \
+scratch.
 
 Rules, no exceptions:
 - Content must be accurate to current anaesthesia practice. Where a fact is \
@@ -33,9 +36,13 @@ explain the tension in ambiguity_note, including which side the exam likely expe
 - Write single-best-answer MCQs: exactly one unambiguously correct option, four \
 plausible distractors. Vary the position of the correct option across the five \
 questions; do not make it always 'A'.
-- The lesson_body should be a focused ~10-minute read: concrete, mechanistic, \
-exam-relevant. British spelling, as used in the SG/UK exam tradition.
-- No filler, no hype.
+- lesson_body: 350-450 words, structured as short punchy paragraphs (1-3 sentences \
+each) and bullet points for lists of facts, values, or steps — not flowing prose. \
+Every sentence should carry exam-relevant signal; cut anything a candidate would \
+already know from having studied the topic once. Prefer a bare fact/value/mechanism \
+over a worked explanation of why it's true, unless the "why" is itself commonly \
+tested. British spelling, as used in the SG/UK exam tradition.
+- No filler, no hype, no restating the question in the answer.
 """
 
 
@@ -85,7 +92,7 @@ Respond with ONLY this JSON shape:
   "topic_area": "{topic['topic_area']}",
   "syllabus_topic": "{topic['topic_title']}",
   "lesson_title": "<short>",
-  "lesson_body": "<~10-minute read, concrete and exam-focused>",
+  "lesson_body": "<350-450 words, condensed revision notes: short paragraphs + bullets, not prose>",
   "reference_citation": "<a real textbook/guideline reference, or empty string>",
   "ambiguity_flag": false,
   "ambiguity_note": "<the tension and which side the exam expects, or empty string>",
