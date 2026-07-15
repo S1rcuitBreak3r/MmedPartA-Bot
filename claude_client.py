@@ -25,7 +25,10 @@ class ClaudeError(RuntimeError):
     """Raised when Claude could not be reached / parsed / validated after all retries."""
 
 
-def _call_raw_sync(system: str, user_message: str, max_tokens: int) -> str:
+def _call_raw_sync(system: str, user_message: str, max_tokens: int) -> tuple[str, str]:
+    """Returns (text, stop_reason). stop_reason == 'max_tokens' means the response was
+    cut off for hitting the token budget — a length problem, not a formatting mistake,
+    so callers must not treat it like an ordinary malformed-JSON retry (see ask_json)."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -35,9 +38,10 @@ def _call_raw_sync(system: str, user_message: str, max_tokens: int) -> str:
                 system=system,
                 messages=[{"role": "user", "content": user_message}],
             )
-            return "".join(
+            text = "".join(
                 block.text for block in response.content if block.type == "text"
             ).strip()
+            return text, response.stop_reason
         except Exception as exc:  # noqa: BLE001 - retry on anything transient
             last_exc = exc
             logger.warning("Claude API call failed (attempt %s/%s): %s", attempt, MAX_RETRIES, exc)
@@ -47,7 +51,8 @@ def _call_raw_sync(system: str, user_message: str, max_tokens: int) -> str:
 
 
 async def ask(system: str, user_message: str, max_tokens: int = 2000) -> str:
-    return await asyncio.to_thread(_call_raw_sync, system, user_message, max_tokens)
+    text, _ = await asyncio.to_thread(_call_raw_sync, system, user_message, max_tokens)
+    return text
 
 
 def _extract_json_block(text: str) -> str:
@@ -63,13 +68,42 @@ def _extract_json_block(text: str) -> str:
         starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
         if starts:
             text = text[min(starts):]
-    # trim any trailing prose after the final closing brace/bracket
-    for closer in ("}", "]"):
-        idx = text.rfind(closer)
-        if idx != -1:
-            text = text[: idx + 1]
-            break
-    return text
+    return _trim_to_matching_close(text)
+
+
+def _trim_to_matching_close(text: str) -> str:
+    """Find where the JSON value starting at index 0 actually closes, respecting string
+    literals and escapes, and drop anything after it (e.g. trailing chat prose).
+
+    A naive `text.rfind('}')` is NOT safe here: exam content routinely contains square
+    brackets inside string values (a reference range like "[4-8 L/min]", a citation like
+    "[1]") — rfind would find THAT bracket instead of the JSON's real closing brace and
+    silently truncate everything after it, corrupting valid JSON. This tracks actual
+    bracket depth and ignores brackets while inside a quoted string.
+    """
+    if not text or text[0] not in "{[":
+        return text
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                return text[: i + 1]
+    return text  # never closed — let json.loads raise its own informative error
 
 
 async def ask_json(system: str, user_message: str, max_tokens: int = 2000, validate=None):
@@ -86,9 +120,21 @@ async def ask_json(system: str, user_message: str, max_tokens: int = 2000, valid
         "no commentary before or after the JSON."
     )
     current_user_message = user_message
+    current_max_tokens = max_tokens
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
-        raw = await ask(strict_system, current_user_message, max_tokens)
+        raw, stop_reason = await asyncio.to_thread(_call_raw_sync, strict_system, current_user_message, current_max_tokens)
+        if stop_reason == "max_tokens":
+            # A genuine length problem, not a formatting mistake — re-nudging "reply with
+            # valid JSON only" would just truncate again at the same budget. Give real
+            # headroom on the retry instead of wasting an attempt on the wrong fix.
+            last_error = f"response truncated at max_tokens={current_max_tokens}"
+            logger.warning(
+                "Claude response hit max_tokens (attempt %s/%s, budget=%s) — raising budget for retry",
+                attempt, MAX_RETRIES, current_max_tokens,
+            )
+            current_max_tokens = min(current_max_tokens * 2, 8192)
+            continue
         candidate = _extract_json_block(raw)
         try:
             obj = json.loads(candidate)

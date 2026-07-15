@@ -98,7 +98,10 @@ Respond with ONLY this JSON shape:
 mcqs must contain EXACTLY 5 questions.
 """
     validator = build_validator({topic["topic_title"]})
-    return await ask_json(PERSONA_SYSTEM_PROMPT, user_message, max_tokens=3000, validate=validator)
+    # A full lesson_body + 5 MCQs (question+5 options+explanation+citation each) plus JSON
+    # overhead comfortably exceeds the original 3000-token budget in practice — give real
+    # headroom; you only pay for tokens actually generated, not the ceiling.
+    return await ask_json(PERSONA_SYSTEM_PROMPT, user_message, max_tokens=4096, validate=validator)
 
 
 def render_lesson(sequence_number: int, data: dict) -> str:

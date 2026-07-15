@@ -10,6 +10,7 @@ persist-before-send / no-regenerate, per-user fault isolation, admin failure ale
 the typing indicator, and the quiz flow (scoring, wrong→retest, completion unpause).
 """
 import asyncio
+import json
 import os
 import sys
 from datetime import datetime, timedelta
@@ -31,6 +32,7 @@ import scheduler  # noqa: E402
 import syllabus_data  # noqa: E402
 import timeutil  # noqa: E402
 from lesson_generator import build_validator  # noqa: E402
+from claude_client import _extract_json_block, ask_json  # noqa: E402
 
 SGT = ZoneInfo("Asia/Singapore")
 FIXED = datetime(2026, 7, 20, 10, 0, 0, tzinfo=SGT)  # a Monday, 10:00 AM (AM window)
@@ -229,6 +231,68 @@ def test_validator():
     check("ambiguity flag w/ empty note rejected", v(badamb) is not None)
     empty = dict(good); m2 = [dict(x) for x in make_mcqs("A")]; m2[1]["option_c"] = ""; empty["mcqs"] = m2
     check("empty option rejected", v(empty) is not None)
+
+
+def test_json_extraction_with_embedded_brackets():
+    print("test_json_extraction_with_embedded_brackets (regression: production incident 2026-07-15)")
+    # A reference range and a citation, both using brackets, embedded in string VALUES —
+    # exactly the pattern that broke the old naive rfind('}')/rfind(']') trim.
+    payload = {
+        "topic_area": "Physiology",
+        "syllabus_topic": "Respiratory",
+        "lesson_title": "Normal ABG values",
+        "lesson_body": "Normal PaCO2 is [4.7-6.0 kPa] and normal pH is [7.35-7.45]. See [1] for detail.",
+        "reference_citation": "Miller's Anaesthesia [9th ed]",
+        "ambiguity_flag": False,
+        "ambiguity_note": "",
+        "mcqs": make_mcqs("A"),
+    }
+    raw = json.dumps(payload) + "\n\nHope that helps! Let me know if you need more."
+    extracted = _extract_json_block(raw)
+    parsed = json.loads(extracted)  # must not raise
+    check("full lesson_body survives extraction (not truncated at an embedded bracket)",
+          parsed["lesson_body"] == payload["lesson_body"])
+    check("all 5 mcqs survive extraction", len(parsed["mcqs"]) == 5)
+    check("trailing chat prose after the JSON is correctly dropped",
+          "Hope that helps" not in extracted)
+
+    # Also: a genuinely truncated response (missing its closing brace) must still fail
+    # loudly rather than being silently "fixed" into something that parses wrong.
+    truncated = json.dumps(payload)[:120]
+    still_broken = _extract_json_block(truncated)
+    check("a genuinely truncated blob is left for json.loads to reject",
+          still_broken == truncated)
+
+
+async def test_max_tokens_truncation_retries_with_bigger_budget():
+    print("test_max_tokens_truncation_retries_with_bigger_budget")
+    calls = []
+
+    async def fake_call(system, user_message, max_tokens):
+        calls.append(max_tokens)
+        if len(calls) == 1:
+            return "{\"incomplete", "max_tokens"
+        good = json.dumps({"ok": True})
+        return good, "end_turn"
+
+    import claude_client
+    orig = claude_client._call_raw_sync
+    orig_to_thread = asyncio.to_thread
+
+    async def patched_to_thread(fn, *args):
+        if fn is claude_client._call_raw_sync:
+            return await fake_call(*args)
+        return await orig_to_thread(fn, *args)
+
+    asyncio.to_thread = patched_to_thread
+    try:
+        result = await ask_json("sys", "msg", max_tokens=100)
+    finally:
+        asyncio.to_thread = orig_to_thread
+
+    check("recovers after a max_tokens truncation", result == {"ok": True})
+    check("retry used a larger token budget, not the same one", calls[1] > calls[0],
+          f"{calls}")
 
 
 def test_topic_distribution():
@@ -459,6 +523,7 @@ def run_sync_tests():
     test_ladder()
     test_upsert_no_duplicate()
     test_validator()
+    test_json_extraction_with_embedded_brackets()
     test_topic_distribution()
     test_whitelist_and_link()
 
@@ -472,6 +537,7 @@ async def run_async_tests():
     await test_admin_alert()
     await test_typing_indicator()
     await test_quiz_flow_scoring_and_retest()
+    await test_max_tokens_truncation_retries_with_bigger_budget()
 
 
 def main():
