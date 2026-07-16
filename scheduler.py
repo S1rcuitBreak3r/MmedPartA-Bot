@@ -14,12 +14,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram.error import TelegramError
 
+import chart_generator
 import curriculum
 import db
 import lesson_generator
@@ -39,6 +41,7 @@ from typing_util import typing_indicator
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MESSAGE_LIMIT = 3500
+CHART_DIR = os.path.join(os.path.dirname(db.DATABASE_PATH) or ".", "charts")
 
 # The single serialization lock, held across every per-user check and every generation.
 _run_lock = asyncio.Lock()
@@ -82,6 +85,22 @@ async def send_with_retry(bot, chat_id: int, text: str):
             raise last_exc
 
 
+async def send_photo_with_retry(bot, chat_id: int, photo_path: str, caption: str | None = None):
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with open(photo_path, "rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+            return
+        except TelegramError as exc:
+            last_exc = exc
+            logger.warning("Telegram photo send failed (attempt %s/%s): %s", attempt, MAX_RETRIES, exc)
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    if last_exc is not None:
+        raise last_exc
+
+
 # --------------------------------------------------------------------------- #
 # Lesson generation — the persist-before-send durability point (§8)
 # --------------------------------------------------------------------------- #
@@ -102,6 +121,15 @@ async def ensure_sequence_generated(seq: int, bot=None, chat_id=None):
         data = await lesson_generator.generate_lesson_data(topic)
 
     rendered = lesson_generator.render_lesson(seq, data)
+
+    chart_path = None
+    chart_spec = data.get("chart")
+    if isinstance(chart_spec, dict) and chart_spec.get("type") in chart_generator.CHART_TYPES:
+        os.makedirs(CHART_DIR, exist_ok=True)
+        candidate_path = os.path.join(CHART_DIR, f"lesson_{seq}.png")
+        if chart_generator.render_chart(chart_spec, candidate_path):
+            chart_path = candidate_path  # persisted below, before any delivery attempt
+
     try:
         db.insert_lesson_and_mcqs(
             seq=seq,
@@ -114,6 +142,7 @@ async def ensure_sequence_generated(seq: int, bot=None, chat_id=None):
             ambiguity_note=str(data.get("ambiguity_note") or "") or None,
             mcqs=data["mcqs"],
             source="ai_generated",
+            chart_path=chart_path,
         )
         db.mark_topic_covered(topic["id"], seq)
     except Exception:
@@ -180,6 +209,8 @@ async def _check_user(bot, user: dict, now):
         rendered = f"{rendered}\n\n{nudge}"
 
     await send_with_retry(bot, chat_id, rendered)  # delivery AFTER persistence
+    if lesson.get("chart_path"):
+        await send_photo_with_retry(bot, chat_id, lesson["chart_path"])
 
     mcqs = db.get_mcqs_for_seq(next_seq)
     questions = quiz_engine.questions_for_lesson(mcqs)
@@ -297,6 +328,8 @@ async def force_lesson(bot, user: dict) -> str:
         if nudge:
             rendered = f"{rendered}\n\n{nudge}"
         await send_with_retry(bot, chat_id, rendered)
+        if lesson.get("chart_path"):
+            await send_photo_with_retry(bot, chat_id, lesson["chart_path"])
 
         mcqs = db.get_mcqs_for_seq(next_seq)
         await quiz_engine.start_quiz(bot, fresh, "daily", next_seq,

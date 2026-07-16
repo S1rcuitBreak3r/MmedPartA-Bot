@@ -27,6 +27,12 @@ Leitner-style spaced-repetition ladder. Full design rationale is in
   retires. Surface due items on demand with `/recap`.
 - **PDF export**: `/exportmcqs` (admin, whole bank) and `/myexport` (self, personal
   history + ladder).
+- **Charts**, Physiology/Pharmacology only: when a lesson genuinely matches one of 7
+  established curve types (O2-Hb dissociation, Frank-Starling, cerebral autoregulation,
+  compliance, concentration-time, dose-response, context-sensitive half-time), Claude picks
+  the type + a few structured params and `chart_generator.py` renders the actual PNG —
+  Claude never generates image content itself. Sent as a follow-up photo after the lesson
+  text; omitted (not forced) for topics that don't match one of the seven.
 
 ## Reliability properties (why the design is the way it is)
 
@@ -38,6 +44,9 @@ Leitner-style spaced-repetition ladder. Full design rationale is in
 - Per-user fault isolation: one candidate's outage never blocks the others in a tick, and
   the admin gets a Telegram DM if a candidate stays stuck across retries.
 - Quiz state lives entirely in SQLite, so a Railway restart mid-quiz resumes cleanly.
+- Chart rendering is best-effort and fault-isolated: `render_chart()` catches every
+  exception and returns `False` rather than raising, so a chart bug never blocks lesson
+  delivery — the lesson and its quiz still go out on schedule.
 
 ---
 
@@ -85,14 +94,15 @@ content from the senior's Notion notes is a tracked follow-up (spec §11), not y
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python test_offline.py        # 72 offline checks, no network — run before every deploy
+python test_offline.py        # 96 offline checks, no network — run before every deploy
 ```
 
 `test_offline.py` covers the daily pace-marker math and the primary anti-flood fix, the
 spaced-rep ladder, the retest upsert, whitelist matching, topic-weighting distribution,
 semantic JSON validation, persist-before-send, per-user fault isolation, the admin alert,
-the typing indicator, and the full quiz-scoring flow. `seed_test_users.py [N]` inserts
-synthetic candidates for DB-level pacing exercises.
+the typing indicator, the full quiz-scoring flow, the ambiguity-flag examiner-referral line
+(both in the Telegram lesson text and the PDF export), and chart validation/rendering/
+delivery. `seed_test_users.py [N]` inserts synthetic candidates for DB-level pacing exercises.
 
 ## Files
 
@@ -104,6 +114,7 @@ db.py                SQLite schema (WAL) + all persistence
 claude_client.py     Anthropic wrapper: retries + JSON syntax AND semantic-contract repair
 curriculum.py        exam-weighted topic selection for the shared lesson_queue
 lesson_generator.py  lesson + 5-MCQ generation, contract validator, bot-owned rendering
+chart_generator.py   7 Physiology/Pharmacology chart templates, bot-owned PNG rendering
 quiz_engine.py       inline-keyboard MCQ quiz, exact-match grading, retest ladder updates
 typing_util.py       re-sending typing / upload-document chat-action context manager
 scheduler.py         per-user pacing, the 4 trigger sites, generation, admin alerting

@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS lesson_queue (
     reference_citation TEXT,
     ambiguity_flag INTEGER NOT NULL DEFAULT 0,
     ambiguity_note TEXT,
-    generated_at TEXT NOT NULL
+    generated_at TEXT NOT NULL,
+    chart_path TEXT              -- absolute path to a rendered chart PNG, or NULL (added 16 Jul 2026)
 );
 
 CREATE TABLE IF NOT EXISTS mcq_bank (
@@ -162,6 +163,21 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate_add_columns(conn)
+
+
+def _migrate_add_columns(conn):
+    """CREATE TABLE IF NOT EXISTS is a no-op against a table that already exists on the
+    live Railway volume, so a column added to SCHEMA above never reaches a deployed DB
+    on its own — ALTER TABLE it in here, idempotently. SQLite has no
+    'ADD COLUMN IF NOT EXISTS', so check PRAGMA table_info first."""
+    migrations = [
+        ("lesson_queue", "chart_path", "TEXT"),
+    ]
+    for table, column, coltype in migrations:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
 # --------------------------------------------------------------------------- #
@@ -449,17 +465,20 @@ def max_sequence_number() -> int:
 
 
 def insert_lesson_and_mcqs(seq, syllabus_topic_id, topic_area, content_json, rendered_text,
-                           reference_citation, ambiguity_flag, ambiguity_note, mcqs, source):
+                           reference_citation, ambiguity_flag, ambiguity_note, mcqs, source,
+                           chart_path=None):
     """The durability point (§8): lesson_queue row + its 5 mcq_bank rows written in ONE
-    transaction, BEFORE any Telegram delivery. Returns the list of inserted mcq ids."""
+    transaction, BEFORE any Telegram delivery. Returns the list of inserted mcq ids.
+    chart_path (added 16 Jul 2026): path to a rendered chart PNG already written to disk
+    by the caller before this call — same persist-before-send discipline as the text."""
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO lesson_queue
                (sequence_number, syllabus_topic_id, topic_area, content_json, rendered_text,
-                reference_citation, ambiguity_flag, ambiguity_note, generated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                reference_citation, ambiguity_flag, ambiguity_note, generated_at, chart_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (seq, syllabus_topic_id, topic_area, content_json, rendered_text,
-             reference_citation, int(ambiguity_flag), ambiguity_note, _now()),
+             reference_citation, int(ambiguity_flag), ambiguity_note, _now(), chart_path),
         )
         mcq_ids = []
         for m in mcqs:

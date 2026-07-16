@@ -24,9 +24,11 @@ os.environ.setdefault("ADMIN_TELEGRAM_USERNAME", "the_admin")
 os.environ["DATABASE_PATH"] = os.path.join(_SCRATCH, "mmed_test.db")
 
 import config  # noqa: E402
+import chart_generator  # noqa: E402
 import db  # noqa: E402
 import curriculum  # noqa: E402
 import lesson_generator  # noqa: E402
+import pdf_export  # noqa: E402
 import quiz_engine  # noqa: E402
 import scheduler  # noqa: E402
 import syllabus_data  # noqa: E402
@@ -62,6 +64,7 @@ class FakeBot:
         self.messages = []   # (chat_id, text)
         self.actions = []    # (chat_id, action)
         self.documents = []
+        self.photos = []     # (chat_id, path, caption)
 
     async def send_message(self, chat_id, text, reply_markup=None):
         self.messages.append((chat_id, text))
@@ -71,6 +74,9 @@ class FakeBot:
 
     async def send_document(self, chat_id, document, filename=None):
         self.documents.append((chat_id, filename))
+
+    async def send_photo(self, chat_id, photo, caption=None):
+        self.photos.append((chat_id, getattr(photo, "name", None), caption))
 
     def lessons_to(self, chat_id):
         return [t for c, t in self.messages if c == chat_id and t.startswith("📘 LESSON")]
@@ -98,6 +104,22 @@ async def fake_generate(topic):
         "reference_citation": "",
         "ambiguity_flag": False,
         "ambiguity_note": "",
+        "chart": None,
+        "mcqs": make_mcqs("A"),
+    }
+
+
+async def fake_generate_with_chart(topic):
+    _gen_calls["n"] += 1
+    return {
+        "topic_area": topic["topic_area"],
+        "syllabus_topic": topic["topic_title"],
+        "lesson_title": "T",
+        "lesson_body": "Body.",
+        "reference_citation": "",
+        "ambiguity_flag": False,
+        "ambiguity_note": "",
+        "chart": {"type": "dose_response_curve", "params": {"curves": ["full_agonist"]}},
         "mcqs": make_mcqs("A"),
     }
 
@@ -233,6 +255,70 @@ def test_validator():
     check("ambiguity flag w/ empty note rejected", v(badamb) is not None)
     empty = dict(good); m2 = [dict(x) for x in make_mcqs("A")]; m2[1]["option_c"] = ""; empty["mcqs"] = m2
     check("empty option rejected", v(empty) is not None)
+
+
+def test_chart_validator():
+    print("test_chart_validator")
+    v = build_validator({"MyTopic"})
+    good = {"topic_area": "Physiology", "syllabus_topic": "MyTopic", "lesson_title": "t",
+            "lesson_body": "b", "ambiguity_flag": False, "ambiguity_note": "", "mcqs": make_mcqs("A")}
+    check("chart omitted entirely passes", v(good) is None)
+    with_null = dict(good); with_null["chart"] = None
+    check("chart explicitly null passes", v(with_null) is None)
+    with_chart = dict(good); with_chart["chart"] = {"type": "dose_response_curve", "params": {}}
+    check("valid chart type passes", v(with_chart) is None)
+    bad_type = dict(good); bad_type["chart"] = {"type": "not_a_real_chart_type"}
+    check("unknown chart type rejected", v(bad_type) is not None)
+    bad_shape = dict(good); bad_shape["chart"] = "not-a-dict"
+    check("non-object chart rejected", v(bad_shape) is not None)
+
+
+def test_ambiguity_flag_rendering():
+    print("test_ambiguity_flag_rendering")
+    flagged = {
+        "topic_area": "Pharmacology", "lesson_title": "T", "lesson_body": "Body text.",
+        "reference_citation": "", "ambiguity_flag": True,
+        "ambiguity_note": "Textbook teaching favours X; recent evidence favours Y.",
+        "mcqs": make_mcqs("A"),
+    }
+    rendered = lesson_generator.render_lesson(1, flagged)
+    check("ambiguity note appears verbatim in the lesson text", flagged["ambiguity_note"] in rendered)
+    check("examiner-referral line appears verbatim when flagged",
+          lesson_generator.AMBIGUITY_LINE in rendered)
+
+    clean = dict(flagged); clean["ambiguity_flag"] = False
+    rendered_clean = lesson_generator.render_lesson(2, clean)
+    check("examiner-referral line absent when ambiguity_flag is false",
+          lesson_generator.AMBIGUITY_LINE not in rendered_clean)
+
+    class FakePdf:
+        def __init__(self):
+            self.lines = []
+
+        def line(self, txt, size=10, style="", h=5):
+            self.lines.append(txt)
+
+        def gap(self, h=2):
+            pass
+
+    mcq_row = {
+        "question_text": "Q?", "option_a": "a", "option_b": "b", "option_c": "c",
+        "option_d": "d", "option_e": "e", "correct_option": "A", "explanation": "because",
+        "reference_citation": "", "lesson_ambiguity_flag": 1,
+        "lesson_ambiguity_note": "Area of genuine controversy.",
+    }
+    fake_pdf = FakePdf()
+    pdf_export._render_bank_question(fake_pdf, 1, mcq_row)
+    check("PDF export includes the ambiguity note",
+          any("Area of genuine controversy." in t for t in fake_pdf.lines))
+    check("PDF export includes the exact examiner-referral line",
+          any(t == lesson_generator.AMBIGUITY_LINE for t in fake_pdf.lines))
+
+    mcq_row_clean = dict(mcq_row); mcq_row_clean["lesson_ambiguity_flag"] = 0
+    fake_pdf2 = FakePdf()
+    pdf_export._render_bank_question(fake_pdf2, 1, mcq_row_clean)
+    check("PDF export omits the examiner-referral line when the lesson isn't flagged",
+          not any(lesson_generator.AMBIGUITY_LINE in t for t in fake_pdf2.lines))
 
 
 def test_json_extraction_with_embedded_brackets():
@@ -445,6 +531,55 @@ async def test_persist_before_send():
     check("still exactly one lesson_queue row", db.max_sequence_number() == 1)
 
 
+def test_chart_rendering():
+    print("test_chart_rendering")
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="mmed_chart_test_")
+    for chart_type in sorted(chart_generator.CHART_TYPES):
+        out = os.path.join(tmp_dir, f"{chart_type}.png")
+        ok = chart_generator.render_chart({"type": chart_type, "params": {}}, out)
+        check(f"{chart_type} renders a non-empty PNG",
+              ok and os.path.exists(out) and os.path.getsize(out) > 0)
+    bad_out = os.path.join(tmp_dir, "bad.png")
+    ok = chart_generator.render_chart({"type": "not_a_real_type", "params": {}}, bad_out)
+    check("unknown chart type returns False rather than raising",
+          ok is False and not os.path.exists(bad_out))
+
+
+async def test_chart_delivery():
+    print("test_chart_delivery")
+    reset_db()
+    install_patches()
+    scheduler.lesson_generator.generate_lesson_data = fake_generate_with_chart
+    try:
+        bot = FakeBot()
+        _seed_candidate("Charty", 700, pace_days_behind=1)
+        await scheduler.run_all(bot)
+    finally:
+        scheduler.lesson_generator.generate_lesson_data = fake_generate
+
+    lesson = db.get_lesson_by_seq(1)
+    check("chart_path persisted on the lesson_queue row", bool(lesson and lesson.get("chart_path")))
+    check("chart PNG exists on disk at the persisted path",
+          bool(lesson and lesson.get("chart_path") and os.path.exists(lesson["chart_path"])))
+    check("chart photo delivered to the candidate after the lesson text",
+          any(c == 700 for c, _path, _caption in bot.photos))
+
+
+async def test_no_chart_when_model_omits_it():
+    print("test_no_chart_when_model_omits_it")
+    reset_db()
+    install_patches()  # back to plain fake_generate, which returns chart: None
+    bot = FakeBot()
+    _seed_candidate("NoChart", 701, pace_days_behind=1)
+    await scheduler.run_all(bot)
+
+    lesson = db.get_lesson_by_seq(1)
+    check("chart_path stays NULL when the model returns no chart",
+          lesson is not None and lesson.get("chart_path") is None)
+    check("no photo sent when there's no chart", len(bot.photos) == 0)
+
+
 async def test_fault_isolation():
     print("test_fault_isolation")
     reset_db()
@@ -551,6 +686,9 @@ def run_sync_tests():
     test_ladder()
     test_upsert_no_duplicate()
     test_validator()
+    test_chart_validator()
+    test_ambiguity_flag_rendering()
+    test_chart_rendering()
     test_json_extraction_with_embedded_brackets()
     test_no_duplicate_username_lookup()
     test_topic_distribution()
@@ -562,6 +700,8 @@ async def run_async_tests():
     await test_slot_gating_catchup()
     await test_reminder_throttle()
     await test_persist_before_send()
+    await test_chart_delivery()
+    await test_no_chart_when_model_omits_it()
     await test_fault_isolation()
     await test_admin_alert()
     await test_typing_indicator()

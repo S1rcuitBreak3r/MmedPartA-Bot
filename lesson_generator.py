@@ -13,12 +13,29 @@ from __future__ import annotations
 import json
 
 from claude_client import ask_json
+from chart_generator import CHART_TYPES
 
 TOPIC_AREAS = {"Pharmacology", "Physiology", "Equipment", "Others"}
 
 AMBIGUITY_LINE = "Ask an appropriate M.Med examiner to resolve this area of controversy."
 
-PERSONA_SYSTEM_PROMPT = """\
+# Charts (added 16 Jul 2026), scoped to Physiology/Pharmacology per the request that
+# prompted the feature. Claude picks a TYPE from this fixed enum + a few structured
+# params (never freeform image content — the Messages API has no image-output
+# capability anyway); chart_generator.py renders the actual pixels deterministically.
+# One line of param guidance per type, kept in front of Claude so it knows the shape
+# without needing a schema round-trip.
+_CHART_TYPE_GUIDANCE = """\
+- "oxyhaemoglobin_dissociation_curve": params {shift: "none"|"right"|"left", shift_factors: [<causes, if shifted>]}
+- "frank_starling_curve": params {curves: [<subset of "normal","heart_failure","increased_contractility">]}
+- "cerebral_autoregulation_curve": params {lower_limit_mmhg: <number>, upper_limit_mmhg: <number>, show_controversy_band: <bool>}
+- "compliance_curve": params {curves: [<subset of "lung","chest_wall","total_respiratory_system">]}
+- "concentration_time_curve": params {route: "iv_bolus"|"iv_infusion"|"oral", compartments: 1|2, half_life_min: <number>}
+- "dose_response_curve": params {curves: [<subset of "full_agonist","partial_agonist","competitive_antagonist_shift","non_competitive_antagonist">]}
+- "context_sensitive_half_time": params {drugs: [<subset of "propofol","fentanyl","remifentanil","alfentanil","sufentanil","thiopentone","midazolam">]}
+"""
+
+PERSONA_SYSTEM_PROMPT = f"""\
 You are writing exam-prep REVISION content for candidates sitting the Singapore \
 M.Med (Anaesthesiology) Part A examination (single-best-answer MCQs, 5 options A-E). \
 This is a quick refresher tool, not a textbook chapter — candidates use it to recall \
@@ -43,6 +60,12 @@ already know from having studied the topic once. Prefer a bare fact/value/mechan
 over a worked explanation of why it's true, unless the "why" is itself commonly \
 tested. British spelling, as used in the SG/UK exam tradition.
 - No filler, no hype, no restating the question in the answer.
+- Chart (optional, Physiology/Pharmacology topics only): if — and only if — this topic \
+centres on one of the well-established curves listed below, set "chart" to an object \
+naming that TYPE plus its params; otherwise set "chart" to null. Never force a chart \
+onto a topic that doesn't genuinely match one of these shapes, and never invent a type \
+or param not listed here:
+{_CHART_TYPE_GUIDANCE}\
 """
 
 
@@ -62,6 +85,12 @@ def build_validator(valid_topic_titles: set[str]):
             return f"syllabus_topic must exactly match the provided topic title"
         if bool(obj.get("ambiguity_flag")) and not str(obj.get("ambiguity_note", "")).strip():
             return "ambiguity_flag is true but ambiguity_note is empty"
+        chart = obj.get("chart")
+        if chart is not None:
+            if not isinstance(chart, dict):
+                return "chart must be null or an object"
+            if chart.get("type") not in CHART_TYPES:
+                return f"chart.type must be one of {sorted(CHART_TYPES)} or chart must be null, got {chart.get('type')!r}"
         mcqs = obj.get("mcqs")
         if not isinstance(mcqs, list) or len(mcqs) != 5:
             return f"mcqs must be a list of exactly 5 items, got {len(mcqs) if isinstance(mcqs, list) else type(mcqs).__name__}"
@@ -96,6 +125,7 @@ Respond with ONLY this JSON shape:
   "reference_citation": "<a real textbook/guideline reference, or empty string>",
   "ambiguity_flag": false,
   "ambiguity_note": "<the tension and which side the exam expects, or empty string>",
+  "chart": null,
   "mcqs": [
     {{"question": "...", "option_a": "...", "option_b": "...", "option_c": "...",
       "option_d": "...", "option_e": "...", "correct_option": "A",
@@ -103,6 +133,9 @@ Respond with ONLY this JSON shape:
   ]
 }}
 mcqs must contain EXACTLY 5 questions.
+chart must be null unless this topic genuinely matches one of the established curve \
+types in the system prompt — {{"type": "<one of the listed types>", "params": {{...}}}} \
+in that case, following the params shape given for that type exactly.
 """
     validator = build_validator({topic["topic_title"]})
     # A full lesson_body + 5 MCQs (question+5 options+explanation+citation each) plus JSON
