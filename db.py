@@ -570,7 +570,24 @@ def get_active_quiz_run(user_id: int):
         if not row:
             return None
         d = dict(row)
-        d["questions"] = json.loads(d["questions_json"])
+        try:
+            parsed = json.loads(d["questions_json"])
+            if not isinstance(parsed, list) or not parsed:
+                raise ValueError("questions_json did not decode to a non-empty list")
+            d["questions"] = parsed
+        except (json.JSONDecodeError, TypeError, ValueError):
+            # A run whose questions can't be read is unusable and would otherwise leave the
+            # user permanently paused with nothing answerable — every recovery command
+            # (/cancelquiz included) calls this same function, so there'd be no way out.
+            # Self-heal: retire the row and clear the pause right here rather than raising.
+            conn.execute(
+                "UPDATE quiz_runs SET status = 'corrupted', completed_at = ? WHERE id = ?",
+                (_now(), d["id"]),
+            )
+            conn.execute(
+                "UPDATE users SET is_paused = 0, paused_since = NULL WHERE id = ?", (user_id,)
+            )
+            return None
         return d
 
 

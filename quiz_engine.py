@@ -13,15 +13,37 @@ against the live active run and is ignored if it doesn't match the current quest
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
 
 import db
-from config import RETEST_INTERVALS, FINAL_STAGE_STREAK_TO_RESOLVE
+from config import RETEST_INTERVALS, FINAL_STAGE_STREAK_TO_RESOLVE, MAX_RETRIES, RETRY_BACKOFF_SECONDS
 from timeutil import sgt_today, to_iso
 
+logger = logging.getLogger(__name__)
+
 _LETTERS = ["A", "B", "C", "D", "E"]
+
+
+async def _send_with_retry(bot, chat_id: int, text: str, reply_markup=None):
+    """Same retry-with-backoff discipline as scheduler.send_with_retry, duplicated here
+    rather than imported: scheduler.py already imports quiz_engine, so importing back
+    would be circular. Quiz messages are always short, so no chunking is needed."""
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            return
+        except TelegramError as exc:
+            last_exc = exc
+            logger.warning("Quiz message send failed (attempt %s/%s): %s", attempt, MAX_RETRIES, exc)
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise last_exc
 
 
 def questions_for_lesson(mcq_rows: list[dict]) -> list[dict]:
@@ -53,23 +75,28 @@ def _render_question(mcq: dict, q_index: int, total: int) -> str:
 
 
 async def _send_question(bot, chat_id: int, run_id: int, q_index: int, total: int, mcq: dict):
-    await bot.send_message(
-        chat_id=chat_id,
-        text=_render_question(mcq, q_index, total),
-        reply_markup=_keyboard(run_id, q_index),
-    )
+    await _send_with_retry(bot, chat_id, _render_question(mcq, q_index, total),
+                           reply_markup=_keyboard(run_id, q_index))
 
 
 async def start_quiz(bot, user: dict, quiz_type: str, lesson_seq, questions: list[dict]) -> int:
     """Create the run, pause the user (invariant §4/§10), send question 1."""
+    if not questions:
+        # Refuse before touching the DB: creating the run and pausing the user here, then
+        # crashing on questions[0] below, would leave them paused with an "active" run that
+        # has nothing to answer — permanently stuck (no delivery is due, no button exists).
+        raise ValueError(
+            f"start_quiz called with zero questions (user_id={user['id']}, "
+            f"quiz_type={quiz_type!r}, lesson_seq={lesson_seq!r})"
+        )
     run_id = db.create_quiz_run(user["id"], quiz_type, lesson_seq, questions)
     db.set_paused(user["id"], True)
     total = len(questions)
     first = db.get_mcq(questions[0]["mcq_id"])
     label = "RECAP" if quiz_type == "recap" else "QUIZ"
-    await bot.send_message(
-        chat_id=user["telegram_chat_id"],
-        text=f"🧠 {label} — {total} question{'s' if total != 1 else ''}, one at a time. Here we go.",
+    await _send_with_retry(
+        bot, user["telegram_chat_id"],
+        f"🧠 {label} — {total} question{'s' if total != 1 else ''}, one at a time. Here we go.",
     )
     await _send_question(bot, user["telegram_chat_id"], run_id, 0, total, first)
     return run_id
@@ -118,7 +145,7 @@ async def process_answer(bot, user: dict, run: dict, selected_option: str) -> st
             f"❌ Not quite — you chose {selected}, the answer is {correct_opt}.\n"
             f"{mcq['explanation']}"
         )
-    await bot.send_message(chat_id=user["telegram_chat_id"], text=feedback)
+    await _send_with_retry(bot, user["telegram_chat_id"], feedback)
 
     next_idx = idx + 1
     if next_idx < total:
@@ -129,9 +156,9 @@ async def process_answer(bot, user: dict, run: dict, selected_option: str) -> st
 
     db.complete_quiz_run(run["id"], new_score)
     db.set_paused(user["id"], False)
-    await bot.send_message(
-        chat_id=user["telegram_chat_id"],
-        text=f"🏁 Done — {new_score}/{total}. Any wrong answers are now scheduled for spaced retest (see /recap).",
+    await _send_with_retry(
+        bot, user["telegram_chat_id"],
+        f"🏁 Done — {new_score}/{total}. Any wrong answers are now scheduled for spaced retest (see /recap).",
     )
     return "completed"
 
@@ -146,10 +173,10 @@ async def skip_quiz(bot, user: dict) -> bool:
     answered = run["current_index"]  # questions fully processed so far
     db.complete_quiz_run(run["id"], run["score"])
     db.set_paused(user["id"], False)
-    await bot.send_message(
-        chat_id=user["telegram_chat_id"],
-        text=f"⏭ Quiz ended early — {run['score']}/{answered} answered scored. "
-             f"The remaining questions were skipped (not added to retest).",
+    await _send_with_retry(
+        bot, user["telegram_chat_id"],
+        f"⏭ Quiz ended early — {run['score']}/{answered} answered scored. "
+        f"The remaining questions were skipped (not added to retest).",
     )
     return True
 
@@ -162,5 +189,5 @@ async def cancel_quiz(bot, user: dict) -> bool:
         return False
     db.cancel_quiz_run(run["id"], status="cancelled")
     db.set_paused(user["id"], False)
-    await bot.send_message(chat_id=user["telegram_chat_id"], text="🚫 Quiz cancelled.")
+    await _send_with_retry(bot, user["telegram_chat_id"], "🚫 Quiz cancelled.")
     return True

@@ -44,9 +44,18 @@ Leitner-style spaced-repetition ladder. Full design rationale is in
 - Per-user fault isolation: one candidate's outage never blocks the others in a tick, and
   the admin gets a Telegram DM if a candidate stays stuck across retries.
 - Quiz state lives entirely in SQLite, so a Railway restart mid-quiz resumes cleanly.
-- Chart rendering is best-effort and fault-isolated: `render_chart()` catches every
-  exception and returns `False` rather than raising, so a chart bug never blocks lesson
-  delivery — the lesson and its quiz still go out on schedule.
+- Chart rendering is best-effort and fault-isolated end to end: `render_chart()` catches
+  every exception internally, the chart-setup step around it (directory creation etc.) is
+  also wrapped so nothing there can block the lesson from persisting, and a chart-photo
+  send that exhausts its retries is caught in `scheduler.py` rather than propagating —
+  the lesson text has already reached the candidate by that point, so letting the
+  exception escape would skip the pace-marker credit and cause a duplicate resend on the
+  next tick.
+- Quiz state is self-healing: `start_quiz()` refuses to create a run with zero questions
+  (rather than pausing the user and then crashing), `get_active_quiz_run()` retires a
+  `questions_json` row that fails to parse instead of raising (so `/cancelquiz` still
+  works even against a corrupted run), and `bot.py`'s answer handler resets and unpauses
+  the user on any unexpected crash mid-grading instead of leaving them stuck.
 
 ---
 
@@ -94,15 +103,19 @@ content from the senior's Notion notes is a tracked follow-up (spec §11), not y
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python test_offline.py        # 96 offline checks, no network — run before every deploy
+python test_offline.py        # 114 offline checks, no network — run before every deploy
 ```
 
 `test_offline.py` covers the daily pace-marker math and the primary anti-flood fix, the
 spaced-rep ladder, the retest upsert, whitelist matching, topic-weighting distribution,
 semantic JSON validation, persist-before-send, per-user fault isolation, the admin alert,
 the typing indicator, the full quiz-scoring flow, the ambiguity-flag examiner-referral line
-(both in the Telegram lesson text and the PDF export), and chart validation/rendering/
-delivery. `seed_test_users.py [N]` inserts synthetic candidates for DB-level pacing exercises.
+(both in the Telegram lesson text and the PDF export), chart validation/rendering/delivery,
+and the chart/quiz fault-isolation hardening (a crashing chart renderer or a chart-photo
+send that exhausts its retries never blocks lesson delivery or duplicates it; a zero-question
+quiz is refused instead of getting stuck; a corrupted `quiz_runs` row self-heals instead of
+crashing `/cancelquiz` and the answer handler). `seed_test_users.py [N]` inserts synthetic
+candidates for DB-level pacing exercises.
 
 ## Files
 

@@ -443,7 +443,25 @@ async def on_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:  # noqa: BLE001
             pass
-        status = await quiz_engine.process_answer(context.bot, user, run, option)
+        try:
+            status = await quiz_engine.process_answer(context.bot, user, run, option)
+        except Exception as exc:  # noqa: BLE001
+            # An unexpected crash mid-grading (e.g. Telegram send exhausted its retries, or
+            # a data inconsistency) must not leave the user stuck paused with a dead run and
+            # no way to recover — self-heal the same way /cancelquiz would, then let the
+            # post-lock recheck below pick up whatever's due next.
+            logger.error("process_answer crashed for user %s, run %s: %s", user["id"], run["id"], exc)
+            db.cancel_quiz_run(run["id"], status="corrupted")
+            db.set_paused(user["id"], False)
+            try:
+                await context.bot.send_message(
+                    chat_id=user["telegram_chat_id"],
+                    text="Something went wrong processing that answer, so this quiz was reset. "
+                         "You're all caught up — the next lesson/recap will arrive as scheduled.",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            status = "completed"
 
     if status == "completed":
         fresh = db.get_user_by_id(user["id"])

@@ -125,10 +125,16 @@ async def ensure_sequence_generated(seq: int, bot=None, chat_id=None):
     chart_path = None
     chart_spec = data.get("chart")
     if isinstance(chart_spec, dict) and chart_spec.get("type") in chart_generator.CHART_TYPES:
-        os.makedirs(CHART_DIR, exist_ok=True)
-        candidate_path = os.path.join(CHART_DIR, f"lesson_{seq}.png")
-        if chart_generator.render_chart(chart_spec, candidate_path):
-            chart_path = candidate_path  # persisted below, before any delivery attempt
+        try:
+            os.makedirs(CHART_DIR, exist_ok=True)
+            candidate_path = os.path.join(CHART_DIR, f"lesson_{seq}.png")
+            if chart_generator.render_chart(chart_spec, candidate_path):
+                chart_path = candidate_path  # persisted below, before any delivery attempt
+        except Exception as exc:  # noqa: BLE001 - a chart is a bonus, never worth failing the lesson over
+            # render_chart() already catches its own exceptions, but directory creation and
+            # anything else in this block must be isolated too — a chart-side failure here
+            # must never prevent the lesson itself from being persisted below.
+            logger.warning("Chart setup failed for sequence %s (non-fatal): %s", seq, exc)
 
     try:
         db.insert_lesson_and_mcqs(
@@ -210,7 +216,14 @@ async def _check_user(bot, user: dict, now):
 
     await send_with_retry(bot, chat_id, rendered)  # delivery AFTER persistence
     if lesson.get("chart_path"):
-        await send_photo_with_retry(bot, chat_id, lesson["chart_path"])
+        try:
+            await send_photo_with_retry(bot, chat_id, lesson["chart_path"])
+        except TelegramError as exc:
+            # The lesson text has already reached the user at this point — a chart-photo
+            # failure must never propagate up and skip record_delivery below, or the next
+            # tick would resend the SAME lesson text the user already received.
+            logger.warning("Chart photo delivery failed for user %s, seq %s (non-fatal): %s",
+                           uid, next_seq, exc)
 
     mcqs = db.get_mcqs_for_seq(next_seq)
     questions = quiz_engine.questions_for_lesson(mcqs)
@@ -329,7 +342,11 @@ async def force_lesson(bot, user: dict) -> str:
             rendered = f"{rendered}\n\n{nudge}"
         await send_with_retry(bot, chat_id, rendered)
         if lesson.get("chart_path"):
-            await send_photo_with_retry(bot, chat_id, lesson["chart_path"])
+            try:
+                await send_photo_with_retry(bot, chat_id, lesson["chart_path"])
+            except TelegramError as exc:
+                logger.warning("Chart photo delivery failed for user %s, seq %s (non-fatal): %s",
+                               fresh["id"], next_seq, exc)
 
         mcqs = db.get_mcqs_for_seq(next_seq)
         await quiz_engine.start_quiz(bot, fresh, "daily", next_seq,

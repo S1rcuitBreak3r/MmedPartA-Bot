@@ -24,6 +24,7 @@ os.environ.setdefault("ADMIN_TELEGRAM_USERNAME", "the_admin")
 os.environ["DATABASE_PATH"] = os.path.join(_SCRATCH, "mmed_test.db")
 
 import config  # noqa: E402
+import bot as bot_module  # noqa: E402
 import chart_generator  # noqa: E402
 import db  # noqa: E402
 import curriculum  # noqa: E402
@@ -35,6 +36,7 @@ import syllabus_data  # noqa: E402
 import timeutil  # noqa: E402
 from lesson_generator import build_validator  # noqa: E402
 from claude_client import _extract_json_block, ask_json  # noqa: E402
+from telegram.error import TelegramError  # noqa: E402
 
 SGT = ZoneInfo("Asia/Singapore")
 FIXED = datetime(2026, 7, 20, 10, 0, 0, tzinfo=SGT)  # a Monday, 10:00 AM (AM window)
@@ -80,6 +82,36 @@ class FakeBot:
 
     def lessons_to(self, chat_id):
         return [t for c, t in self.messages if c == chat_id and t.startswith("📘 LESSON")]
+
+
+class FakeCallbackQuery:
+    def __init__(self, data):
+        self.data = data
+        self.answers = []
+        self.edits = 0
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append(text)
+
+    async def edit_message_reply_markup(self, reply_markup=None):
+        self.edits += 1
+
+
+class FakeChat:
+    def __init__(self, chat_id):
+        self.id = chat_id
+
+
+class FakeUpdate:
+    """Minimal duck-typed stand-in for telegram.Update, just enough for on_answer."""
+    def __init__(self, chat_id, data):
+        self.callback_query = FakeCallbackQuery(data)
+        self.effective_chat = FakeChat(chat_id)
+
+
+class FakeContext:
+    def __init__(self, bot):
+        self.bot = bot
 
 
 def make_mcqs(correct="A"):
@@ -566,6 +598,56 @@ async def test_chart_delivery():
           any(c == 700 for c, _path, _caption in bot.photos))
 
 
+async def test_chart_setup_crash_does_not_block_lesson_persistence():
+    print("test_chart_setup_crash_does_not_block_lesson_persistence")
+    reset_db()
+    install_patches()
+    scheduler.lesson_generator.generate_lesson_data = fake_generate_with_chart
+
+    def boom_render(chart_spec, output_path):
+        raise RuntimeError("simulated chart renderer crash")
+
+    orig_render = scheduler.chart_generator.render_chart
+    scheduler.chart_generator.render_chart = boom_render
+    try:
+        row = await scheduler.ensure_sequence_generated(1)
+    finally:
+        scheduler.lesson_generator.generate_lesson_data = fake_generate
+        scheduler.chart_generator.render_chart = orig_render
+
+    check("lesson still persisted despite an unexpected chart-renderer crash", row is not None)
+    check("5 mcqs still persisted despite the crash", len(db.get_mcqs_for_seq(1)) == 5)
+    check("chart_path left NULL rather than the crash propagating",
+          row is not None and row.get("chart_path") is None)
+
+
+async def test_chart_photo_failure_does_not_block_delivery():
+    print("test_chart_photo_failure_does_not_block_delivery (regression: table-message-loses-lesson bug pattern)")
+    reset_db()
+    install_patches()
+    scheduler.lesson_generator.generate_lesson_data = fake_generate_with_chart
+
+    async def flaky_photo(bot_, chat_id, photo_path, caption=None):
+        raise TelegramError("simulated photo failure (all retries exhausted)")
+
+    orig_photo = scheduler.send_photo_with_retry
+    scheduler.send_photo_with_retry = flaky_photo
+    try:
+        bot = FakeBot()
+        user = _seed_candidate("PhotoFail", 820, pace_days_behind=1)
+        await scheduler.run_all(bot)
+    finally:
+        scheduler.lesson_generator.generate_lesson_data = fake_generate
+        scheduler.send_photo_with_retry = orig_photo
+
+    check("lesson text still delivered despite the chart photo failing",
+          len(bot.lessons_to(820)) == 1)
+    check("pace credit still consumed (no risk of resending the same lesson next tick)",
+          db.get_progress(user["id"])["current_sequence_number"] == 1)
+    check("quiz still started despite the chart photo failing",
+          db.get_active_quiz_run(user["id"]) is not None)
+
+
 async def test_no_chart_when_model_omits_it():
     print("test_no_chart_when_model_omits_it")
     reset_db()
@@ -648,6 +730,101 @@ async def test_typing_indicator():
     check("typing stops after context exit", len(bot.actions) == sent_during)
 
 
+async def test_zero_question_quiz_refused():
+    print("test_zero_question_quiz_refused")
+    reset_db()
+    bot = FakeBot()
+    uid = db.create_user("zeroq", "ZeroQ", telegram_chat_id=810, whitelist_status="active")
+    user = db.get_user_by_id(uid)
+
+    raised = False
+    try:
+        await quiz_engine.start_quiz(bot, user, "daily", 1, [])
+    except ValueError:
+        raised = True
+    check("start_quiz refuses zero questions instead of creating a stuck run", raised)
+    check("no quiz_run row was created for the refused attempt",
+          db.get_active_quiz_run(uid) is None)
+    check("user was never paused by the refused attempt",
+          db.get_user_by_id(uid)["is_paused"] == 0)
+
+
+def test_corrupted_quiz_run_self_heals():
+    print("test_corrupted_quiz_run_self_heals")
+    reset_db()
+    uid = db.create_user("crashuser", "CrashUser", telegram_chat_id=850, whitelist_status="active")
+
+    db.set_paused(uid, True)
+    with db.get_conn() as conn:
+        conn.execute(
+            """INSERT INTO quiz_runs (user_id, quiz_type, lesson_sequence_number, status,
+                                      questions_json, current_index, score, total_questions, started_at)
+               VALUES (?, 'daily', 1, 'in_progress', ?, 0, 0, 5, '2026-07-20T00:00:00+00:00')""",
+            (uid, "{not valid json"),
+        )
+    run = db.get_active_quiz_run(uid)
+    check("malformed questions_json returns None instead of raising", run is None)
+    check("user is unpaused after self-heal", db.get_user_by_id(uid)["is_paused"] == 0)
+    with db.get_conn() as conn:
+        r = conn.execute(
+            "SELECT status FROM quiz_runs WHERE user_id=? ORDER BY id DESC LIMIT 1", (uid,)
+        ).fetchone()
+    check("corrupted run marked 'corrupted' in the DB, not left in_progress", r["status"] == "corrupted")
+
+    # Valid JSON but the wrong shape (empty list) must self-heal the same way.
+    db.set_paused(uid, True)
+    with db.get_conn() as conn:
+        conn.execute(
+            """INSERT INTO quiz_runs (user_id, quiz_type, lesson_sequence_number, status,
+                                      questions_json, current_index, score, total_questions, started_at)
+               VALUES (?, 'daily', 2, 'in_progress', '[]', 0, 0, 0, '2026-07-20T00:00:00+00:00')""",
+            (uid,),
+        )
+    run2 = db.get_active_quiz_run(uid)
+    check("empty-list questions_json also self-heals rather than returning a zero-question run",
+          run2 is None)
+    check("user unpaused again after the second self-heal", db.get_user_by_id(uid)["is_paused"] == 0)
+
+
+async def test_answer_handler_recovers_from_crash():
+    print("test_answer_handler_recovers_from_crash")
+    reset_db()
+    install_patches()
+    bot = FakeBot()
+    user = _seed_candidate("Crashy", 800, pace_days_behind=1)
+    await scheduler.ensure_sequence_generated(1)
+    mcqs = db.get_mcqs_for_seq(1)
+    await quiz_engine.start_quiz(bot, user, "daily", 1, quiz_engine.questions_for_lesson(mcqs))
+    run = db.get_active_quiz_run(user["id"])
+
+    async def boom(*a, **kw):
+        raise RuntimeError("simulated crash")
+
+    async def noop_recheck(*a, **kw):
+        return None
+
+    orig_process_answer = quiz_engine.process_answer
+    orig_recheck = bot_module.sched.recheck_user
+    quiz_engine.process_answer = boom
+    bot_module.sched.recheck_user = noop_recheck
+    try:
+        update = FakeUpdate(800, f"ans:{run['id']}:0:A")
+        ctx = FakeContext(bot)
+        await bot_module.on_answer(update, ctx)
+    finally:
+        quiz_engine.process_answer = orig_process_answer
+        bot_module.sched.recheck_user = orig_recheck
+
+    check("handler doesn't raise, and unpauses the user after a crashed answer",
+          db.get_user_by_id(user["id"])["is_paused"] == 0)
+    check("crashed run no longer active", db.get_active_quiz_run(user["id"]) is None)
+    with db.get_conn() as conn:
+        r = conn.execute("SELECT status FROM quiz_runs WHERE id=?", (run["id"],)).fetchone()
+    check("crashed run marked 'corrupted' in the DB", r["status"] == "corrupted")
+    check("recovery message sent to the user",
+          any("reset" in t.lower() for c, t in bot.messages if c == 800))
+
+
 async def test_quiz_flow_scoring_and_retest():
     print("test_quiz_flow_scoring_and_retest")
     reset_db()
@@ -689,6 +866,7 @@ def run_sync_tests():
     test_chart_validator()
     test_ambiguity_flag_rendering()
     test_chart_rendering()
+    test_corrupted_quiz_run_self_heals()
     test_json_extraction_with_embedded_brackets()
     test_no_duplicate_username_lookup()
     test_topic_distribution()
@@ -701,7 +879,11 @@ async def run_async_tests():
     await test_reminder_throttle()
     await test_persist_before_send()
     await test_chart_delivery()
+    await test_chart_setup_crash_does_not_block_lesson_persistence()
+    await test_chart_photo_failure_does_not_block_delivery()
     await test_no_chart_when_model_omits_it()
+    await test_zero_question_quiz_refused()
+    await test_answer_handler_recovers_from_crash()
     await test_fault_isolation()
     await test_admin_alert()
     await test_typing_indicator()
