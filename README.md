@@ -93,6 +93,27 @@ they get their numeric id from **@userinfobot** and the admin links it directly.
    auto-created admin row. Then `/adduser` each candidate (or `/linkuser` for anyone
    without a username).
 
+> ### ⚠️ Data persistence — the #1 thing to get right
+>
+> If **`DATABASE_PATH` isn't set** (step 4) **or the volume isn't actually mounted at
+> `/data`** (step 3), the database lands on the container's temporary disk, and **every
+> user is wiped on each redeploy** — you'd have to re-add everyone after every deploy.
+> This is silent unless you check for it.
+>
+> The bot now prints its persistence state on every boot. In **View Logs** right after a
+> deploy, look for:
+> ```
+> Database file: /data/mmed_bot.db
+> Users present at startup: 5 total, 4 active candidate(s).
+> ```
+> - If the path shows a **bare filename** (`mmed_bot.db`) instead of `/data/...`, the
+>   `DATABASE_PATH` variable isn't set — a loud `WARNING` banner will also appear. Fix
+>   step 4.
+> - If the path is right but the **user count drops to 0 (or just the admin) after a
+>   redeploy**, the variable is set but the volume isn't mounted at that path. Fix step 3.
+> - When both are correct, the user count stays the same across redeploys — that's the
+>   confirmation persistence is working.
+
 The syllabus is seeded automatically on first boot from `syllabus_data.py`. Verified-bank
 content from the senior's Notion notes is a tracked follow-up (spec §11), not yet ingested.
 

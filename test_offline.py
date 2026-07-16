@@ -749,6 +749,20 @@ async def test_zero_question_quiz_refused():
           db.get_user_by_id(uid)["is_paused"] == 0)
 
 
+def test_ephemeral_db_path_detection():
+    print("test_ephemeral_db_path_detection")
+    check("relative path flagged as ephemeral (the redeploy-wipes-users default)",
+          bot_module._looks_ephemeral("mmed_bot.db") is True)
+    check("bare filename flagged as ephemeral",
+          bot_module._looks_ephemeral("data/mmed_bot.db") is True)
+    check("absolute volume path NOT flagged (persists across redeploys)",
+          bot_module._looks_ephemeral("/data/mmed_bot.db") is False)
+    # _log_persistence_state must run without raising against a real DB (logs only).
+    reset_db()
+    bot_module._log_persistence_state()
+    check("_log_persistence_state runs cleanly against a populated DB", True)
+
+
 def test_corrupted_quiz_run_self_heals():
     print("test_corrupted_quiz_run_self_heals")
     reset_db()
@@ -866,6 +880,7 @@ def run_sync_tests():
     test_chart_validator()
     test_ambiguity_flag_rendering()
     test_chart_rendering()
+    test_ephemeral_db_path_detection()
     test_corrupted_quiz_run_self_heals()
     test_json_extraction_with_embedded_brackets()
     test_no_duplicate_username_lookup()

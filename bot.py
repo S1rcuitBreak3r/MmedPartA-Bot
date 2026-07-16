@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from telegram import Update
 from telegram.ext import (
@@ -473,8 +474,43 @@ async def on_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Startup
 # --------------------------------------------------------------------------- #
 
+def _looks_ephemeral(path: str) -> bool:
+    """A RELATIVE DATABASE_PATH resolves inside the container's working directory, which
+    Railway rebuilds from scratch on every redeploy — so the database (and every user in
+    it) is wiped each deploy. An absolute path on a mounted volume (e.g. /data/mmed_bot.db)
+    persists. (Absolute is necessary but not sufficient: the volume must actually be
+    mounted there, which is why _log_persistence_state also logs the live user count as a
+    second signal.)"""
+    return not os.path.isabs(path)
+
+
+def _log_persistence_state():
+    """Make WHERE the database lives, and how many users are in it, visible in the boot
+    logs — so a redeploy that silently lost data (DB on ephemeral disk, not a volume) is
+    obvious at a glance instead of only surfacing when someone finds themselves un-added."""
+    resolved = os.path.abspath(db.DATABASE_PATH)
+    users = db.list_users()
+    active_candidates = sum(
+        1 for u in users if u["role"] == "candidate" and u["whitelist_status"] == "active"
+    )
+    logger.info("Database file: %s", resolved)
+    logger.info("Users present at startup: %s total, %s active candidate(s).",
+                len(users), active_candidates)
+    if _looks_ephemeral(db.DATABASE_PATH):
+        logger.warning(
+            "=" * 72 + "\n"
+            "  DATABASE_PATH=%r is a RELATIVE path. It resolves to the container's\n"
+            "  EPHEMERAL filesystem and will be ERASED on every redeploy, taking all\n"
+            "  users with it. Set DATABASE_PATH to a file on a mounted Railway volume\n"
+            "  (e.g. /data/mmed_bot.db) so data survives deploys.\n"
+            + "=" * 72,
+            db.DATABASE_PATH,
+        )
+
+
 async def _post_init(application: Application):
     db.init_db()
+    _log_persistence_state()
     seeded = db.seed_syllabus_topics(syllabus_data.iter_seed_rows())
     if seeded:
         logger.info("Seeded syllabus_topics with %s rows.", seeded)
